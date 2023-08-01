@@ -293,6 +293,8 @@ func compareListElems(a : MyActor) {
 
 There is one other category of diagnostic emitted by this pass. As described in the [section above](#regionrules), the default function convention assumes that functions do not consume the regions of their arguments (including `self`). Thus making an isolation-crossing call passing any non-sendable values in the same region as a non-sendable `self` value, or any non-sendable args, will be an error.
 
+<a name="passtoactor"></a>
+
 ```swift
 func passToActor(a : MyActor, v : NonSendableValue) {
   a.foo(v) // warning: call site passes `self` or a non-sendable argument of this function to another thread, potentially yielding a race with the caller
@@ -361,9 +363,31 @@ The `SendNonSendable` pass, if adopted, would encourage the development of libra
 
 ### <a name="consumingargs"></a>Consuming args
 
+In the current implementation of `SendNonSendable`, functions cannot consume their arguments. This greatly constricts allowed programming patterns. To send a value to another isolation domain, that value *must* have been initialized locally, not read from an argument or from `self`'s storage. Allowing values from `self`'s storage to be safely sent to other threads is the subject of the (`iso` fields)[#iso] extension discussed below and is a bit involved, but allowing arguments to be sent (i.e. consumed), is much simpler. All that is necessary is to add a `consuming` annotation to function signatures that indicates that certain arguments could be consumed by the end of the function body. As a simplest example, the following code shows the behavior of the `consuming` annotation:
+
+```swift
+func passToActorConsuming(a : MyActor, consuming v : NonSendableValue) {
+  a.foo(v)
+}
+
+func genAndPassToConsuming(a : MyActor) {
+  let v = NonSendableValue()
+  
+  // call consumes v
+  passToActorConsuming(a, v)
+  
+  // access here NOT allowed
+  print(v)
+}
+```
+
+Unlike the prior function (`passToActor`)[#passtoactor] defined above, `passToActorConsuming` *does* typecheck now, but `genAndPassToConsuming` does not - the inverse situation of the non-consuming functions.
+
+`consuming` parameters are a very natural programming pattern. Without them, it is only possible for non-sendable values to ever make a single hop between domains. They are also very easy to implement, and might even be done so before the acceptance of this proposal. The largest difficulty with the addition of this feature is ergonomic interplay with the existing `consuming` annotation that exists in the Swift language. The existing `consuming` keyword focuses on non-copyable types - and specifies ownership conventions for handling refcounts and deallocation. This is related to the idea of `consuming` needed by `SendNonSendable`(let's call it `region-consuming` for now), and in fact, any case in which a parameter is `region-consuming`, it should also be `consuming` (in the existing Swift, non-copyable, sense). Unfortunately, the converse does not hold. For example, parameters to initializers and setters are usually `consuming`, but they should not be `region-consuming`. The reason for this is that the region-based typechecking of `SendNonSendable` is able to track the fact that by passing values to a setter or initializer, ownership has been transferred, but to a known target: the region of `self` of the called method. Thus by not marking such parameters as `region-consuming`, they can still be used after being passed to a setter or initializer as long as the set or initialized value is not consumed. If all such methods' parameters were `region-consuming`, then even if `self` were not consumed, the arguments to the methods would not be accessible after the call.
+
 ### Returning fresh
 
-### `iso` fields
+### <a name="iso"></a>`iso` fields
 
 ## Alternatives considered
 
