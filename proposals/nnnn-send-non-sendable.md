@@ -7,7 +7,7 @@
 * Vision: *if applicable* [Vision Name](https://github.com/apple/swift-evolution/visions/NNNNN.md)
 * Roadmap: *if applicable* [Roadmap Name](https://forums.swift.org/...))
 * Bug: *if applicable* [apple/swift#NNNNN](https://github.com/apple/swift/issues/NNNNN)
-* Implementation: [apple/swift#NNNNN](https://github.com/apple/swift/pull/NNNNN) or [apple/swift-evolution-staging#NNNNN](https://github.com/apple/swift-evolution-staging/pull/NNNNN)
+* Implementation: available on public Github: [SendNonSendable.cpp](https://github.com/apple/swift/blob/main/lib/SILOptimizer/Mandatory/SendNonSendable.cpp)
 * Upcoming Feature Flag: `SendNonSendable`
 * Review: ([pitch](https://forums.swift.org/...))
 
@@ -108,7 +108,7 @@ Instead of emitting the `non_sendable_call_argument` diagnostic, the `TypeCheckC
 
 The key question then becomes: how does the SIL pass determine which isolation-crossing applications could yield races? 
 
-### At a high level: simple rules for regions
+### <a name="regionrules"></a> At a high level: simple rules for regions
 
 All non-sendable values within a function body are tracked to determine what region they reside in. Some simple rules regarding value initialization:
 
@@ -210,7 +210,9 @@ actor NationalPark {
   }
 }
 
-func visitParks(_ parks : [NationalPark], _ visitor : Visitor) {
+func visitParks(_ parks : [NationalPark], _ visitorName : String) {
+	let visitor = Visitor(visitorName)
+  
   for park in parks
   	// this call enters the `park` actor, so it
     // consumes `visitor`
@@ -228,7 +230,9 @@ On the other hand, the call to `admitVisitor` in the nonisolated function `visit
 Special functions that create new tasks, such as `Task.init` or `Task.detached`, or functions that otherwise cause passed closures to execute concurrently with the caller such as `MainActor.run`, must also consume their argument. In particular, the argument will be a closure, so any values captured in the closure will be in the same region as that closure, and consuming it will consume those values. This consumption prevents races on those values between the caller and the executor of the passed closure. This prevents the following possible racy code from being expressible as well:
 
 ```swift
-func visitParksParallel(_ parks : [NationalPark], _ visitor : Visitor) {
+func visitParksParallel(_ parks : [NationalPark], _ visitorName : String) {
+  let visitor = Visitor(visitorName)
+  
   for park in parks
   	Task {
       await park.admitVisitor(visitor) // will error - closure creation consumes `visitor`
@@ -245,7 +249,71 @@ Additionally, to achieve the desired level of expressivity, it will be necessary
 
 ### Diagnostics
 
-The easiest way to generate diagnostics for this pass would be
+The easiest way to generate diagnostics for the `SendNonSendable` pass would be to note each code site at which a value is accessed, but is known by the pass to be in a consumed region. These diagnostics would read something like:
+
+```swift
+func giveBoxToActor(a : MyActor) {
+  let b = Box()
+  
+  a.accessBox(b)
+  
+  if (b.contents >= 7) { // warning: value of non-sendable type `Box` accessed here, but could've been sent to concurrently executing code above, yielding a potential raace
+		....
+}
+```
+
+Entirely correct semantics for this pass could be implemented with this diagnostic style, i.e. diagnostics could be thrown iff the pass discovers an error, but this style of diagnostics is potentially confusing to programmers. Although it is not the site at which the error is discovered, the site at which the isolation-crossing send actually took place is likely a much more logical place to put the warning. This is likely because the calls that cross isolations are trivially known to be sites at which concurrency, and concurrent communication, comes into play. The sites at which values in consumed regions are accessed, however, could be any valid AST node in the Swift language. At a high level, it seems reasonable to expect programmers to think the most carefully about the values being sent at the points concurrent communciation is performed. Thus, although a race arises from the combination of a value sent at such a point with a value in the smae region accessed later in the function, highlighting the point at which the value sent allows the programmer to continue to focus their debugging efforts largely on the points at which concurrency communication is performed. In line with this reasoning, the `SendNonSendable` implementation instead emits diagnostics like the following:
+
+```swift
+func giveBoxToActor(a : MyActor) {
+  let b = Box()
+  
+  a.accessBox(b) // warning: passing argument of non-sendable type 'Box' from nonisolated context to actor-isolated context at this call site could yield a race with accesses later in this function (1 access site displayed)
+  
+  if (b.contents >= 7) { // note: access here could race
+		....
+}
+```
+
+If there are multiple sites at which values in the region of the sent value are accessed, they will all be displayed:
+
+```swift
+func compareListElems(a : MyActor) {
+  let myList : [NonSendableElem] = genList()
+  
+  let elem0 = myList.min(by : {$0 < $1})
+  let elem1 = myList.max(by : {$0 < $1})
+  
+  a.displayElem(elem0) // warning: passing argument of non-sendable type 'NonSendableElem' from nonisolated context to actor-isolated context at this call site could yield a race with accesses later in this function (2 access sites displayed)
+  
+	print("min: \(elem0)") // note: access here could race
+  print("max: \(elem1)") // note: access here could race
+}
+```
+
+There is one other category of diagnostic emitted by this pass. As described in the [section above](#regionrules), the default function convention assumes that functions do not consume the regions of their arguments (including `self`). Thus making an isolation-crossing call passing any non-sendable values in the same region as a non-sendable `self` value, or any non-sendable args, will be an error.
+
+```swift
+func passToActor(a : MyActor, v : NonSendableValue) {
+  a.foo(v) // warning: call site passes `self` or a non-sendable argument of this function to another thread, potentially yielding a race with the caller
+}
+```
+
+As the diagnostic message indicates, this warning is necessary because function conventions allow code that continues using non-sendable arguments after they are passed to a non-isolation-crossing call.
+
+```swift
+func genAndPassTo(a : MyActor) {
+  let v = NonSendableValue()
+  
+  // call does NOT consume v
+  passToActor(a, v)
+  
+  // access here allowed
+  print(v)
+}
+```
+
+To allow the function `passToActor` above to typecheck, a `consuming`-style annotation is needed. See the section [Consuming args](#consumingargs) below.
 
 ### At an implementation level
 
@@ -291,7 +359,9 @@ The `SendNonSendable` pass, if adopted, would encourage the development of libra
 
 ## Future directions
 
-### Fancier function signatures
+### <a name="consumingargs"></a>Consuming args
+
+### Returning fresh
 
 ### `iso` fields
 
