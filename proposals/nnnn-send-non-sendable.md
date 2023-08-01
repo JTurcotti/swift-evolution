@@ -420,7 +420,27 @@ Running the `SendNonSendable` pass now involved also ensuring that any values us
 
 ### <a name="iso"></a>`iso` fields
 
-In the system outlined up to this point, a notable week point
+In the system outlined up to this point, a notable weak point lies in that regions tend to grow very large. In fact, any data structures, including actors and all their stroage, will comprise a single region. As shown in the rest of this proposal, this still allows a large variety of concurrent programming patterns currently impossible in Swift, but it also bans many more. For example, it prevents actors from sending parts of their state to other actors and replacing it with fresh values, such as the following:
+
+```swift
+actor IndecisiveBox {
+  var contents : NonSendable
+  
+  func setContents(_ val : NonSendable) {
+    contents = val
+  }
+  
+  func swapWithOtherBox(_ otherBox : IndecisiveBox) async {
+		let otherContents = await otherBox.contents
+    await otherBox.setContents(contents) // warning: call site passes `self` or a non-sendable argument of this function to another thread, potentially yielding a race with the caller
+    contents = otherContents
+  }
+}
+```
+
+This could be a perfectly safe pattern, but in the current `SendNonSendable` pass will produce diagnostics as shown above. The issue is that it is not statically known that it is safe to send `contents` to another thread while continuing to access the rest of the actor's storage. To this end, the system could introduce the `iso` keyword. 
+
+TODO: expand on this section.
 
 ### Async let, and task completion
 
