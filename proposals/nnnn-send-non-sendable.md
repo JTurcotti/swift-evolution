@@ -32,7 +32,7 @@ class DataView { ... }
 // a function that displays the passed object
 @MainActor func addToDisplay(dataView : DataView) { ... }
 
-// a function that compute a view of passed data and displays it
+// a function that builds a view of passed data and displays it
 @MainActor func buildAndDisplayData(data : Data) {
   let builtView : DataView = buildView(data : data)
   addToDisplay(builtView)
