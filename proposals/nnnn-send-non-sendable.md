@@ -13,11 +13,11 @@
 
 ## Introduction
 
-Swift Concurrency splits memory into the "isolation domains" of various actors and tasks. Computations isolated to distinct domains can execute concurrently, so to prevent data races it is vital that no mutable state is simultaneously accessible from multiple domains. The Swift type system ensures this separation property by allowing only references to deeply immutable values to be communicated between isolation domains - such values conform to the `Sendable` protocol. 
+Swift Concurrency splits memory into the "isolation domains" of various actors and tasks. Computations isolated to distinct domains can execute concurrently, so to prevent data races it is vital that no mutable state is simultaneously accessible from multiple domains. The Swift type system ensures this separation property by allowing only references to deeply immutable values to be communicated between isolation domains. This is enforced through `Sendable` checking; only deeply immutable values can safely conform to the `Sendable` protocol, and only values that conform to the `Sendable` protocol can cross isolation domains.
 
-Unfortunately, requiring `Sendable` conformance for all values communicated between isolation domains is very restrictive in practice. For example, mutable objects cannot be constructed by one actor and then sent to another, even if they are never accessed except to be constructed then sent. A flow-sensitive analysis that determines whether values of arbitrary type can be safely without introduing data races sent would allow this pattern, and thus provide a large increase in the expressivity of Swift concurrency.
+Unfortunately, requiring `Sendable` conformance for all values that cross isolation domains is very restrictive in practice. For example, mutable objects cannot be constructed by one actor and then sent to another, even if they are never accessed except to be constructed then sent. A flow-sensitive analysis that determines whether values of arbitrary type can be safely sent without introduing data races would allow this pattern, and thus provide a large increase in the expressivity of Swift concurrency.
 
-The `SendNonSendable` pass, currently available as an experimental feature, implements a flow-sensitive analysis that tracks non-`Sendable` values, allowing them to be sent between isolation domains but marking them as "consumed" when they are. This ensures that any potential data races resulting from concurrent access in the sending and receiving domains are avoided. The crux of this analysis is grouping values that could alias or reference each other into static "regions". Sending a value should consume the value itself and all other aliasing or referencing values in its region, as accessing those values after the send could also yield a race.
+The `SendNonSendable` pass, currently available as an experimental feature, implements such a flow-sensitive analysis. It tracks all non-`Sendable` values within function scopes, allowing them to be sent between isolation domains but marking them as "consumed" when they are. Consumed values can henceforth not be accessed. This ensures that any potential data races resulting from concurrent access in the sending and receiving domains are avoided. The crux of this analysis is grouping values that could alias or reference each other into static "regions". Sending a value should consume the value itself and all other aliasing or referencing values in its region, as accessing those values after the send could also yield a race.
 
 This pass allows for greater flexibility of programming with Swift concurrency, without sacrificing data-race freedom or ergonomics.
 
@@ -33,20 +33,20 @@ class DataView { ... }
 @MainActor func addToDisplay(dataView : DataView) { ... }
 
 // a function that compute a view of passed data and displays it
-@MainActor func displayData(data : Data) {
+@MainActor func buildAndDisplayData(data : Data) {
   let builtView : DataView = buildView(data : data)
   addToDisplay(builtView)
 }
 ```
 
-`addToDisplay` displays a `DataView` object to the user, a UI action, so should be main actor isolated. The function `displayData` that builds up a `DataView` and passes it to `addToDisplay` must also be main actor isolated because `DataView` is not `Sendable`, so could not be passed from outside the main actor into it. This is functionally correct, but could have very poor performance if `buildView` is an expensive operation - as it will be forced to run on the main actor. With current Swift concurrency, there is no safe solution that allows the `DataView` to be constructed off the main actor, and displayed by the main actor, and thus an unnecessary tradeoff between performance and safety exists.
+`addToDisplay` displays a `DataView` object to the user, a UI action, so should be main actor isolated. The function `buildAndDisplayData` that builds up a `DataView` and passes it to `addToDisplay` must also be main actor isolated because `DataView` is not `Sendable`, so could not be passed from outside the main actor into it. This is functionally correct, but could have very poor performance if `buildView` is an expensive operation - as it will be forced to run on the main actor. With current Swift concurrency, there is no safe solution that allows the `DataView` to be constructed off the main actor, and displayed by the main actor, and thus an unnecessary tradeoff between performance and safety exists.
 
 ## Proposed solution
 
-Ideally, the function `displayData` would not have to be main actor isolated. The expensive `buildView` operation could happen asynchronously on another actor, and the main actor could be invoked only when the `DataView` has been built and is ready to be displayed, such as in the following code:
+Ideally, the function `buildAndDisplayData` would not have to be main actor isolated. The expensive `buildView` operation could happen asynchronously on another actor, and the main actor could be invoked only when the `DataView` has been built and is ready to be displayed, such as in the following code:
 
 ```swift
-func displayData(data : Data) async {
+func buildAndDisplayData(data : Data) async {
   let builtView : DataView = buildView(data : data)
   
   await MainActor.run {
@@ -58,7 +58,7 @@ func displayData(data : Data) async {
 Because `MainActor.run` currently takes a `@Sendable` closure, this code would not be allowed; the passed closure cannot capture `builtView` of non-sendable type. The `SendNonSendable` pass allows this code by allowing `MainActor.run` to take any closure, including non-sendable ones, but ensuring that any values captured in that closure are rendered inaccessible after the isolation-crossing invocation of `MainActor.run`. For example, the following code would produce diagnostics:
 
 ```swift
-func displayData(data : Data) async {
+func buildAndDisplayData(data : Data) async {
   let builtView : DataView = buildView(data : data)
   
   await MainActor.run {
@@ -72,7 +72,7 @@ func displayData(data : Data) async {
 There are more subtle cases in which races could arise as well, in which the value being access is not exactly one captured by a closure that crosses isolation domains:
 
 ```swift
-func displayData(data : Data) async {
+func buildAndDisplayData(data : Data) async {
   let builtView : DataView = buildView(data : data)
   
   listOfViews.append(builtView)
@@ -119,7 +119,7 @@ It is important to keep in mind that these regions are a purely static abstracti
 
 ```swift
 class NonSendable {
-	var x : SendableType
+  var x : SendableType
   var y : OtherNonSendableType?
   
   init(_ x : SendableType, _ y : OtherNonSendableType? = none) {
@@ -141,10 +141,11 @@ Functions in general actually exhibit the same semantics: non-sendable arguments
 
 ```swift
 func compareBoxContents(_ box0 : Box, _ box1 : Box) {
-  if (box0.contents == box1.contents)
-  	print("the same")
-  else
-	  print("different")
+  if (box0.contents == box1.contents) {
+    print("the same")
+  } else {
+    print("different")
+  }
 }
 
 func reassignBoxContents(_ box0 : Box, _ box1 : Box) {
@@ -193,7 +194,7 @@ When a non-sendable value is passed to an actor-entering call, i.e. a call to an
 
 ```swift
 actor NationalPark {
-	var visitors : [Visitor]
+  var visitors : [Visitor]
   
   func admitVisitor(_ visitor : Visitor) {
     visitors.append(visitor)
@@ -210,14 +211,15 @@ actor NationalPark {
   }
 }
 
-func visitParks(_ parks : [NationalPark], _ visitorName : String) {
-	let visitor = Visitor(visitorName)
+func visitParks(_ parks : [NationalPark], _ visitorName : String) async {
+  let visitor = Visitor(visitorName)
   
-  for park in parks
-  	// this call enters the `park` actor, so it
+  for park in parks {
+    // this call enters the `park` actor, so it
     // consumes `visitor`
     // accessing `visitor` in a loop is thus an error
-  	await park.admitVisitor(visitor) // callsite 2 - ERROR
+    await park.admitVisitor(visitor) // callsite 2 - ERROR
+  }
 }
 ```
 
@@ -233,10 +235,11 @@ Special functions that create new tasks, such as `Task.init` or `Task.detached`,
 func visitParksParallel(_ parks : [NationalPark], _ visitorName : String) {
   let visitor = Visitor(visitorName)
   
-  for park in parks
-  	Task {
+  for park in parks {
+    Task {
       await park.admitVisitor(visitor) // will error - closure creation consumes `visitor`
     }
+  }
 }
 ```
 
@@ -252,10 +255,10 @@ Additionally, to achieve the desired level of expressivity, it will be necessary
 The easiest way to generate diagnostics for the `SendNonSendable` pass would be to note each code site at which a value is accessed, but is known by the pass to be in a consumed region. These diagnostics would read something like:
 
 ```swift
-func giveBoxToActor(a : MyActor) {
+func giveBoxToActor(a : MyActor) async {
   let b = Box()
   
-  a.accessBox(b)
+  await a.accessBox(b)
   
   if (b.contents >= 7) { // warning: value of non-sendable type `Box` accessed here, but could've been sent to concurrently executing code above, yielding a potential raace
 		....
@@ -265,10 +268,10 @@ func giveBoxToActor(a : MyActor) {
 Entirely correct semantics for this pass could be implemented with this diagnostic style, i.e. diagnostics could be thrown iff the pass discovers an error, but this style of diagnostics is potentially confusing to programmers. Although it is not the site at which the error is discovered, the site at which the isolation-crossing send actually took place is likely a much more logical place to put the warning. This is likely because the calls that cross isolations are trivially known to be sites at which concurrency, and concurrent communication, comes into play. The sites at which values in consumed regions are accessed, however, could be any valid AST node in the Swift language. At a high level, it seems reasonable to expect programmers to think the most carefully about the values being sent at the points concurrent communciation is performed. Thus, although a race arises from the combination of a value sent at such a point with a value in the smae region accessed later in the function, highlighting the point at which the value sent allows the programmer to continue to focus their debugging efforts largely on the points at which concurrency communication is performed. In line with this reasoning, the `SendNonSendable` implementation instead emits diagnostics like the following:
 
 ```swift
-func giveBoxToActor(a : MyActor) {
+func giveBoxToActor(a : MyActor) async {
   let b = Box()
   
-  a.accessBox(b) // warning: passing argument of non-sendable type 'Box' from nonisolated context to actor-isolated context at this call site could yield a race with accesses later in this function (1 access site displayed)
+  await a.accessBox(b) // warning: passing argument of non-sendable type 'Box' from nonisolated context to actor-isolated context at this call site could yield a race with accesses later in this function (1 access site displayed)
   
   if (b.contents >= 7) { // note: access here could race
 		....
@@ -278,15 +281,15 @@ func giveBoxToActor(a : MyActor) {
 If there are multiple sites at which values in the region of the sent value are accessed, they will all be displayed:
 
 ```swift
-func compareListElems(a : MyActor) {
+func compareListElems(a : MyActor) async {
   let myList : [NonSendableElem] = genList()
   
   let elem0 = myList.min(by : {$0 < $1})
   let elem1 = myList.max(by : {$0 < $1})
   
-  a.displayElem(elem0) // warning: passing argument of non-sendable type 'NonSendableElem' from nonisolated context to actor-isolated context at this call site could yield a race with accesses later in this function (2 access sites displayed)
+  await a.displayElem(elem0) // warning: passing argument of non-sendable type 'NonSendableElem' from nonisolated context to actor-isolated context at this call site could yield a race with accesses later in this function (2 access sites displayed)
   
-	print("min: \(elem0)") // note: access here could race
+  print("min: \(elem0)") // note: access here could race
   print("max: \(elem1)") // note: access here could race
 }
 ```
@@ -296,19 +299,19 @@ There is one other category of diagnostic emitted by this pass. As described in 
 <a name="passtoactor"></a>
 
 ```swift
-func passToActor(a : MyActor, v : NonSendableValue) {
-  a.foo(v) // warning: call site passes `self` or a non-sendable argument of this function to another thread, potentially yielding a race with the caller
+func passToActor(a : MyActor, v : NonSendableValue) async {
+  await a.foo(v) // warning: call site passes `self` or a non-sendable argument of this function to another thread, potentially yielding a race with the caller
 }
 ```
 
 As the diagnostic message indicates, this warning is necessary because function conventions allow code that continues using non-sendable arguments after they are passed to a non-isolation-crossing call.
 
 ```swift
-func genAndPassTo(a : MyActor) {
+func genAndPassTo(a : MyActor) async {
   let v = NonSendableValue()
   
   // call does NOT consume v
-  passToActor(a, v)
+  await passToActor(a, v)
   
   // access here allowed
   print(v)
@@ -366,15 +369,15 @@ The `SendNonSendable` pass, if adopted, would encourage the development of libra
 In the current implementation of `SendNonSendable`, functions cannot consume their arguments. This greatly constricts allowed programming patterns. To send a value to another isolation domain, that value *must* have been initialized locally, not read from an argument or from `self`'s storage. Allowing values from `self`'s storage to be safely sent to other threads is the subject of the `iso` fields extension (discussed below)[#iso] and is a bit involved, but allowing arguments to be sent (i.e. consumed), is much simpler. All that is necessary is to add a `consuming` annotation to function signatures that indicates that certain arguments could be consumed by the end of the function body. As a simplest example, the following code shows the behavior of the `consuming` annotation:
 
 ```swift
-func passToActorConsuming(a : MyActor, consuming v : NonSendableValue) {
-  a.foo(v)
+func passToActorConsuming(a : MyActor, consuming v : NonSendableValue) async {
+  await a.foo(v)
 }
 
-func genAndPassToConsuming(a : MyActor) {
+func genAndPassToConsuming(a : MyActor) async {
   let v = NonSendableValue()
   
   // call consumes v
-  passToActorConsuming(a, v)
+  await passToActorConsuming(a, v)
   
   // access here NOT allowed
   print(v)
@@ -431,7 +434,7 @@ actor IndecisiveBox {
   }
   
   func swapWithOtherBox(_ otherBox : IndecisiveBox) async {
-		let otherContents = await otherBox.contents
+    let otherContents = await otherBox.contents
     await otherBox.setContents(contents) // warning: call site passes `self` or a non-sendable argument of this function to another thread, potentially yielding a race with the caller
     contents = otherContents
   }
