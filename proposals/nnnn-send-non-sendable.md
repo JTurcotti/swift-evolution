@@ -29,7 +29,7 @@ The following code demonstrates a situation in which:
 - `NearestNeighbors.init` is a very expensive operation
 - Ultimately, a `NearestNeighbors` instance needs to be displayed to the user via an `addToDisplay` call
 
-The code illustrates a reasonable attempt to use the `NearestNeighbors` to model and display location data.
+The code illustrates a reasonable attempt to use the `NearestNeighbors` class to model and display location data.
 
 ```swift
 // A representation of location data that associates each point with `numNeighbors`
