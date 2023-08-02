@@ -17,88 +17,136 @@ Swift Concurrency splits memory into the "isolation domains" of various actors a
 
 Unfortunately, requiring `Sendable` conformance for all values that cross isolation domains is very restrictive in practice. For example, mutable objects cannot be constructed by one actor and then sent to another, even if they are never accessed except to be constructed then sent. A flow-sensitive analysis that determines whether values of arbitrary type can be safely sent without introduing data races would allow this pattern, and thus provide a large increase in the expressivity of Swift concurrency.
 
-The `SendNonSendable` pass, currently available as an experimental feature, implements such a flow-sensitive analysis. It tracks all non-`Sendable` values within function scopes, allowing them to be sent between isolation domains but marking them as "consumed" when they are. Consumed values can henceforth not be accessed. This ensures that any potential data races resulting from concurrent access in the sending and receiving domains are avoided. The crux of this analysis is grouping values that could alias or reference each other into static "regions". Sending a value should consume the value itself and all other aliasing or referencing values in its region, as accessing those values after the send could also yield a race.
+The `SendNonSendable` pass, currently available as an experimental feature, implements such a flow-sensitive analysis. It tracks all non-`Sendable` values within function scopes, allowing them to be sent between isolation domains but marking them as "transferred" when they are. Transferred values can henceforth not be accessed. This ensures that any potential data races resulting from concurrent access in the sending and receiving domains are avoided. The crux of this analysis is grouping values that could alias or reference each other into static "regions". Sending a value should transfer away the value itself and all other aliasing or referencing values in its region, as accessing those values after the send could also yield a race.
 
 This pass allows for greater flexibility of programming with Swift concurrency, without sacrificing data-race freedom or ergonomics.
 
 ## Motivation
 
-Consider simple code like this:
+The following code demonstrates a situation in which:
+
+- `NearestNeighbors` is a class that cannot safely be made `Sendable` due to the presence of cycles
+- `NearestNeighbors.init` is a very expensive operation
+- Ultimately, a `NearestNeighbors` instance needs to be displayed to the user via an `addToDisplay` call
+
+The code illustrates a reasonable attempt to use the `NearestNeighbors` to model and display location data.
 
 ```swift
-// an object that can be displayed to the user - not Sendable
-class DataView { ... }
+// A representation of location data that associates each point with `numNeighbors`
+// of its nearest neighbors in a dataset. This yields connected clusters of
+// points, one root of each of which is stored in `rootPoints`.
+class NearestNeighbors { 
+  class DataPoint {
+    // point to the `numNeighbors` nearest neighbors of this point
+    var nearestPoints : [DataPoint]
+    ...
+  }
+  
+  let numNeighbors : Int
+  var rootPoints : [DataPoint]
+  ...
+}
+	
+// Build the nearest neighbors graph, associating each point in the dataset `data`
+// with its `numNeighbors` nearest neighbors, and storing a point from each resulting
+// cluster in `rootPoints`.
+// EXPENSIVE operation
+func computeNearestNeighbors(data : LocationData, numNeighbors : Int = 10) -> NearestNeighbors { ... }
 
-// a function that displays the passed object
-@MainActor func addToDisplay(dataView : DataView) { ... }
+// display a nearest neighbors graph to the user
+// UI operation - so must be `@MainActor`
+@MainActor func addToDisplay(neighbors : NearestNeighbors) { ... }
 
-// a function that builds a view of passed data and displays it
-@MainActor func buildAndDisplayData(data : Data) {
-  let builtView : DataView = buildView(data : data)
-  addToDisplay(builtView)
+// take location data, build a nearest neighbors graph for it, and display it to the user
+func computeAndDisplayData(data : LocationData) async {
+  let neighbors = computeNearestNeighbors(data: data)
+  await addToDisplay(neighbors) // warning: passing argument of non-sendable type 'NearestNeighbors' into @MainActor-isolated context may introduce data races
 }
 ```
 
-`addToDisplay` displays a `DataView` object to the user, a UI action, so should be main actor isolated. The function `buildAndDisplayData` that builds up a `DataView` and passes it to `addToDisplay` must also be main actor isolated because `DataView` is not `Sendable`, so could not be passed from outside the main actor into it. This is functionally correct, but could have very poor performance if `buildView` is an expensive operation - as it will be forced to run on the main actor. With current Swift concurrency, there is no safe solution that allows the `DataView` to be constructed off the main actor, and displayed by the main actor, and thus an unnecessary tradeoff between performance and safety exists.
+Unfortunately, current Swift strict concurrency does not allow this code. Since `computeAndDisplayData` is a `nonisolated` function, and `addToDisplay` is `@MainActor`-isolated, the call `await addToDisplay(neighbors)` crosses isolation domains, and thus is not permitted to pass non-sendable values. To make the compiler accept this code, there are three options:
+
+- Disable strict concurrency checking (undesirable)
+- Make `NearestNeighbors` `Sendable` (not possible because can't create a cyclic graph with only `let` bindings)
+- Make `computeAndDisplayData` `@MainActor`-isolated (undesirable because this would cause the main thread to hang while computing the nearest neighbors graph)
+
+There is thus currently no way to build and display this graph-like `NearestNeighbor`s object without giving up either safety (data-race freedom) or performance. 
 
 ## Proposed solution
 
-Ideally, the function `buildAndDisplayData` would not have to be main actor isolated. The expensive `buildView` operation could happen asynchronously on another actor, and the main actor could be invoked only when the `DataView` has been built and is ready to be displayed, such as in the following code:
+To a human programmer, the function `computeAndDisplayData` is clearly safe. Swift concurrency prevents `neighbors` from being sent across isolation domains to the main actor because of the potential for the main actor to race with the remainder of `computeAndDisplayData` over access to `neighbors`. But `computeAndDisplayData` doesn't access `neighbors` again after the call, and doesn't allow it to escape. What is needed is a pass that can tell the difference between safe functions like:
 
 ```swift
-func buildAndDisplayData(data : Data) async {
-  let builtView : DataView = buildView(data : data)
-  
-  await MainActor.run {
-    addToDisplay(builtView)
-  }
+// SAFE:
+func computeAndDisplayData(data : LocationData) async {
+  let neighbors = computeNearestNeighbors(data: data)
+  await addToDisplay(neighbors)
+  // no subsequent access to `neighbors`
 }
 ```
 
-Because `MainActor.run` currently takes a `@Sendable` closure, this code would not be allowed; the passed closure cannot capture `builtView` of non-sendable type. The `SendNonSendable` pass allows this code by allowing `MainActor.run` to take any closure, including non-sendable ones, but ensuring that any values captured in that closure are rendered inaccessible after the isolation-crossing invocation of `MainActor.run`. For example, the following code would produce diagnostics:
+and unsafe functions like:
 
 ```swift
-func buildAndDisplayData(data : Data) async {
-  let builtView : DataView = buildView(data : data)
-  
-  await MainActor.run {
-    addToDisplay(builtView)
-  }
-  
-  builtView.updateContents() // error: access here could race
+// UNSAFE:
+func computeAndDisplayData(data : LocationData) async {
+  let neighbors = computeNearestNeighbors(data: data)
+  await addToDisplay(neighbors)
+  neighbors.addNewData(receiveNewData()) // racy access to `neighbors`
 }
 ```
 
-There are more subtle cases in which races could arise as well, in which the value being access is not exactly one captured by a closure that crosses isolation domains:
+or:
 
 ```swift
-func buildAndDisplayData(data : Data) async {
-  let builtView : DataView = buildView(data : data)
-  
-  listOfViews.append(builtView)
-  
-  let bestView = listOfViews.max(by: { $0.value > $1.value })
-  
-  await MainActor.run {
-    addToDisplay(builtView)
-  }
-  
-  bestView.updateContents() // error: access here could race
+// UNSAFE:
+func computeAndDisplayData(data : LocationData) async -> NearestNeigbors {
+  let neighbors = computeNearestNeighbors(data: data)
+  await addToDisplay(neighbors)
+  return neighbors // allowing `neighbors` to escape
 }
 ```
 
-Here, accessing `bestView` after the invocation of `MainActor.run` is still a potential race, as `bestView` could alias `builtView`. Thus it is necessary not just to mark `builtView` as consumed after the invocation - but a whole *region* of values including `listOfViews` and `bestViews` that could potentially alias or reference `builtView`. The job of the `SendNonSendable` pass is to track aliasing and other references between values in scope so that they may be partitioned into regions. At any program point, the `SendNonSendable` pass provides this partitioning. This allows safe sending of non-sendable values between isolation domains because it is statically known which values must be marked inaccessible after the send - all other values in its region.
+Current Swift sendable checking is not flow-sensitive, so it cannot determine whether implementations access non-sendable values after they're sent across isolations. This forces it to ban sending non-sendable values across isolations outright.
 
- Thus the job of the pass is, in three parts:
+This motivates the development of the `SendNonSendable` pass, currently available as `-enable-experimental-feature SendNonSendable`. The `SendNonSendable` pass treats non-sendable values linearly: allowing them to be freely used up until they're sent across isolations, at which point they're treated as *transferred* and subsequent usages of them yield diagnostics. This linear checking allows the `SendNonSendable` pass to determine that the safe version of `computeAndDisplay` above is race-free, and suppress any sendable diagnostics that would be thrown about it, and to determine that the unsafe versions are race-prone, and emit informative diagnostics about the potential races.
 
-- track which **non-sendable values** belong to which regions
-  - For example, track that `builtView`, `listOfViews` and `bestView` are all in the same region above
-- mark whole regions of **non-sendable values** as consumed when any of their member values are sent between isolation domains
-  - For example, mark that the region containing `builtView` is consumed after `MainActor.run` above
-- prevent access to any **non-sendable values** in consumed regions.
-  - For example, prevent the access to `bestView` above because that value is in a consumed region
+### Regions
 
-Note the emphasis passed on **non-sendable values** - values of sendable type are ignored by this pass and subject to typechecking exactly as currently implemented.
+The above unsafe examples are clearly racy because a single value, `neighbors`, is sent across isolations then accessed or escaped. There are also examples in which races could arise where it's slightly less obvious that accessing the sent value could race with accessing the kept value. 
+
+```swift
+func computeAndDisplayLargest(datasets : [LocationData]) async {
+  var listOfGraphs : [NearestNeighbors]
+  for data in datasets {
+    listOfGraphs.append(computeNearestNeighbors(data : data))
+  }
+  
+  let largestGraph = listOfViews.max(by: { $0.numRootPoints() > $1.numRootPoints() })
+  let smallestGraph = listOfViews.min(by: { $0.numRootPoints() > $1.numRootPoints() })
+  
+  await addToDisplay(largestGraph)
+  
+  smallestGraph.decreaseClusterSize(1)
+}
+```
+
+In this function, `Largest` attempts to display the largest `NearestNeighbor` graph generated from a list of datasets passed to the function. No single value appears to be both sent across isolations and subsequently accessed. However, there is no guarantee that `largestGraph` and `smallestGraph` are distinct values - they could be the same value! So the access and mutation of `smallestGraph` via `smallestGraph.decreaseClusterSize(1)` could race with the access to `largestGraph` granted to the main actor via `await addToDisplay(largestGraph)`. 
+
+Strict linearity would solve this by preventing aliasing to ever arise in the first place by banning obvious aliasing (e.g. `let x = y`), and as a result preventing implementations of functions like `min` and `max` that provide first class references to objects still present elsewhere in a datastructure. In short - strict linearity enforces "one first class reference at a time" semantics. This is an unnatural programming model, and in addition to outright preventing certain APIs from being implemented it is awkward and cumbersome to work with (try googling "how to write a doubly linked list in Rust"). 
+
+The solution that the `SendNonSendable` pass choosed to implement in place of strict, value-level linearity, is *linear regions*. Regions are collections of values that could alias or reference each other, split up so that two values in separate regions *cannot* ever alias or reference each other. Operations such as cross-isolation method calls that would transfer ownership of values instead transfer ownership of *entire regions* at a time - allowing aliasing to arise but preventing it from leading to races. For example, in the above `computeAndDisplayLargest` function, the values `listOfGraphs`, `largestGraph`, and `smallestGraph` would all be considered in the same region - allowing the `SendNonSendable` code to realize that the access  `smallestGraph.decreaseClusterSize(1)` is potentially racy because `smallestGraph`'s region was already transferred to a different isolation. 
+
+To summarize, the proposed `SendNonSendable` pass accomplished the goal of allowing non-sendable values to be sent across isolations while maintaining data-race freedom by:
+
+- Tracking all **non-sendable values** in scope at all program points, partitioning them into *regions* that are permitted to contain arbitrarily aliased values, but are guaranteed not to alias each other
+  - For example, track that `listOfGraphs`, `largestGraph` and `smallestGraph` are all in the same region above
+- At program points where **non-sendable values** cross isolations, transfer away the region containing that value
+  - For example, mark that the region containing `largestGraph` as transferred after the call to `addToDisplay`
+- Produce diagnostics upon access to any **non-sendable** values in regions that have already been transfered away
+  - For example, prevent the access to `smallestGraph` above because that value is in a transferred region
+
+Note the emphasis passed on **non-sendable values** - values of sendable type are ignored by this pass, and subject to typechecking exactly as currently implemented.
 
 ## Detailed design
 
@@ -158,12 +206,12 @@ let (box0, box1) = Box(), Box()
 
 compareBoxContents(box0, box1) // this call merges the regions of box0 and box1
 
-// this consumes the region of box0
+// this transfers the region of box0
 Task {
   box0.contents.increment()
 }
 
-// this is an error, because the region of box1 was consumed
+// this is an error, because the region of box1 was transfered
 // (same region as box0)
 Task {
   box1.contents.increment()
@@ -182,15 +230,15 @@ In summary, regions are "created" when non-sendable values such as classes are i
 - `z = { ... x ... y ...}`: capturing non-sendable values `x` and `y` in a closure merges their regions, and yields a new closure `z` in the same region as `x` and `y`
 - `if/for/while/switch` (control flow): if `x` and `y` are in the same region in any predecessor basic block of a function, then they will be merged into the same region in all successors of that basic block
 
-The result of this is that at the point of a send of a non-sendable value between isolation domains, all other values that could potentially be aliased or referenced from/by it, even along just one control flow path to the send, will be known to be in the same region as it, and will be marked "consumed" and be rendered inaccessible after the send.
+The result of this is that at the point of a send of a non-sendable value between isolation domains, all other values that could potentially be aliased or referenced from/by it, even along just one control flow path to the send, will be known to be in the same region as it, and will be marked "transferred " and be rendered inaccessible after the send.
 
 ### Crossing Isolation Domains
 
-The function conventions outlined above apply to function calls that will execute synchonrously in the same isolation domain as the caller. Calls that can cross isolation domains have slightly different semantics: instead of just being merged, the regions of all non-sendable arguments to a cross-isolation call are *consumed* as well. The reason this is necessary is different for the two types of calls that pass values across isolation domains.
+The function conventions outlined above apply to function calls that will execute synchonrously in the same isolation domain as the caller. Calls that can cross isolation domains have slightly different semantics: instead of just being merged, the regions of all non-sendable arguments to a cross-isolation call are *transferred away* as well. The reason this is necessary is different for the two types of calls that pass values across isolation domains.
 
 #### Calls into actors
 
-When a non-sendable value is passed to an actor-entering call, i.e. a call to an actor method from any isolation except that actor's own isolation, the value could "escape" into the storage of that actor. So even after the (necessarily async) call returns, the actor could process a new request concurrently with the caller executuing more code. Since the originally passed value is now accesssible to the actor through its storage, the caller must be banned from accessing it to prevent a data race. Thus actor-entering calls must consume their arguments. The following code illustrates this:
+When a non-sendable value is passed to an actor-entering call, i.e. a call to an actor method from any isolation except that actor's own isolation, the value could "escape" into the storage of that actor. So even after the (necessarily async) call returns, the actor could process a new request concurrently with the caller executuing more code. Since the originally passed value is now accesssible to the actor through its storage, the caller must be banned from accessing it to prevent a data race. Thus actor-entering calls must transfer their arguments. The following code illustrates this:
 
 ```swift
 actor NationalPark {
@@ -202,7 +250,7 @@ actor NationalPark {
   
   func admitAndGreetVisitor(_ visitor : Visitor) {
     // this call does not cross isolations,
-    // so it does not consume `visitor`, it just merges its region
+    // so it does not transfer `visitor`, it just merges its region
     // with the region of `self`
     admitVisitor(visitor) // callsite 1 - safe
     
@@ -216,20 +264,20 @@ func visitParks(_ parks : [NationalPark], _ visitorName : String) async {
   
   for park in parks {
     // this call enters the `park` actor, so it
-    // consumes `visitor`
+    // transfers `visitor`
     // accessing `visitor` in a loop is thus an error
     await park.admitVisitor(visitor) // callsite 2 - ERROR
   }
 }
 ```
 
-Note that the call to `admitVisitor` within the actor method `admitAndGreetVisitor` labelled `callsite 1` does NOT consume its argument, and continued access after the callsite is permitted. This is because that call is NOT a cross-actor call, so there is no risk of another actor holding a reference to the argument.
+Note that the call to `admitVisitor` within the actor method `admitAndGreetVisitor` labelled `callsite 1` does NOT transfer its argument, and continued access after the callsite is permitted. This is because that call is NOT a cross-actor call, so there is no risk of another actor holding a reference to the argument.
 
-On the other hand, the call to `admitVisitor` in the nonisolated function `visitParks` labelled `callsite 2` enters an actor, so it DOES consume its argument. This makes the written code unsafe, and indeed it yields an error. If the code were allowed, then multiple actors could concurrently reference the same `visitor` object from their storage, racing on it. 
+On the other hand, the call to `admitVisitor` in the nonisolated function `visitParks` labelled `callsite 2` enters an actor, so it DOES transfer its argument. This makes the written code unsafe, and indeed it yields an error. If the code were allowed, then multiple actors could concurrently reference the same `visitor` object from their storage, racing on it. 
 
 #### Task creation
 
-Special functions that create new tasks, such as `Task.init` or `Task.detached`, or functions that otherwise cause passed closures to execute concurrently with the caller such as `MainActor.run`, must also consume their argument. In particular, the argument will be a closure, so any values captured in the closure will be in the same region as that closure, and consuming it will consume those values. This consumption prevents races on those values between the caller and the executor of the passed closure. This prevents the following possible racy code from being expressible as well:
+Special functions that create new tasks, such as `Task.init` or `Task.detached`, or functions that otherwise cause passed closures to execute concurrently with the caller such as `MainActor.run`, must also transfer their argument. In particular, the argument will be a closure, so any values captured in the closure will be in the same region as that closure, and consuming it will transfer those values. This consumption prevents races on those values between the caller and the executor of the passed closure. This prevents the following possible racy code from being expressible as well:
 
 ```swift
 func visitParksParallel(_ parks : [NationalPark], _ visitorName : String) {
@@ -237,22 +285,22 @@ func visitParksParallel(_ parks : [NationalPark], _ visitorName : String) {
   
   for park in parks {
     Task {
-      await park.admitVisitor(visitor) // will error - closure creation consumes `visitor`
+      await park.admitVisitor(visitor) // will error - closure creation transfers `visitor`
     }
   }
 }
 ```
 
-User-defined functions that takes non-sendable closures should not, in general, exhibit isolation-crossing semantics and consume their arguments, so it will be necessary to inform the `SendNonSendable` analysis of the special functions such as `Task.init`, `Task.detached`, and `MainActor.run` that execute their passed closure under different isolation than or concurrently with the caller. Two possible approaches for this are:
+User-defined functions that takes non-sendable closures should not, in general, exhibit isolation-crossing semantics and transfer their arguments, so it will be necessary to inform the `SendNonSendable` analysis of the special functions such as `Task.init`, `Task.detached`, and `MainActor.run` that execute their passed closure under different isolation than or concurrently with the caller. Two possible approaches for this are:
 
 1. Hard-code a list of such functions - possible but likely considered bad practice
-2. Mark such functions with an annotation such as `@IsolationCrossing` at the source level where they're defined. This is likely the better-practice approach but could potentially lead to API/ABI breaks.
+2. Mark such functions with an annotation such as `@IsolationCrossing` at the source level where they're defined. 
 
-Additionally, to achieve the desired level of expressivity, it will be necessary to *remove* the source-level `@Sendable` annotation on the types of the arguments to these functions. Without the introduction of the `SendNonSendable` pass, race-freedom is attained for functions such as `Task.detached` only by ensuring they only take `@Sendable` args. This prevents entirely the passing of closures that capture non-sendable values to these functions (as such closures are necessarily `@Sendable`). By implementing the `SendNonSendable` pass, sendable closures will still be able to be passed freely to these functions, but non-sendable closures will not be outright banned - rather they will be subject to the same flow-sensitive region-base checking as all other non-sendable values passed to isolation-crossing calls: if their region has not been consumed the call will be allowed, and otherwise it will throw an error. This change (removing `@Sendable` from the argument signatures of these functions) is necessary, but unfortunately may be an API/ABI break.
+Additionally, to achieve the desired level of expressivity, it will be necessary to *remove* the source-level `@Sendable` annotation on the types of the arguments to these functions. Without the introduction of the `SendNonSendable` pass, race-freedom is attained for functions such as `Task.detached` only by ensuring they only take `@Sendable` args. This prevents entirely the passing of closures that capture non-sendable values to these functions (as such closures are necessarily `@Sendable`). By implementing the `SendNonSendable` pass, sendable closures will still be able to be passed freely to these functions, but non-sendable closures will not be outright banned - rather they will be subject to the same flow-sensitive region-base checking as all other non-sendable values passed to isolation-crossing calls: if their region has not been transferred the call will be allowed, and otherwise it will throw an error. This change (removing `@Sendable` from the argument signatures of these functions) is necessary.
 
 ### Diagnostics
 
-The easiest way to generate diagnostics for the `SendNonSendable` pass would be to note each code site at which a value is accessed, but is known by the pass to be in a consumed region. These diagnostics would read something like:
+The easiest way to generate diagnostics for the `SendNonSendable` pass would be to note each code site at which a value is accessed, but is known by the pass to be in a transferred region. These diagnostics would read something like:
 
 ```swift
 func giveBoxToActor(a : MyActor) async {
@@ -265,7 +313,7 @@ func giveBoxToActor(a : MyActor) async {
 }
 ```
 
-Entirely correct semantics for this pass could be implemented with this diagnostic style, i.e. diagnostics could be thrown iff the pass discovers an error, but this style of diagnostics is potentially confusing to programmers. Although it is not the site at which the error is discovered, the site at which the isolation-crossing send actually took place is likely a much more logical place to put the warning. This is likely because the calls that cross isolations are trivially known to be sites at which concurrency, and concurrent communication, comes into play. The sites at which values in consumed regions are accessed, however, could be any valid AST node in the Swift language. At a high level, it seems reasonable to expect programmers to think the most carefully about the values being sent at the points concurrent communciation is performed. Thus, although a race arises from the combination of a value sent at such a point with a value in the smae region accessed later in the function, highlighting the point at which the value sent allows the programmer to continue to focus their debugging efforts largely on the points at which concurrency communication is performed. In line with this reasoning, the `SendNonSendable` implementation instead emits diagnostics like the following:
+Entirely correct semantics for this pass could be implemented with this diagnostic style, i.e. diagnostics could be thrown iff the pass discovers an error, but this style of diagnostics is potentially confusing to programmers. Although it is not the site at which the error is discovered, the site at which the isolation-crossing send actually took place is likely a much more logical place to put the warning. This is likely because the calls that cross isolations are trivially known to be sites at which concurrency, and concurrent communication, comes into play. The sites at which values in transferred regions are accessed, however, could be any valid AST node in the Swift language. At a high level, it seems reasonable to expect programmers to think the most carefully about the values being sent at the points concurrent communciation is performed. Thus, although a race arises from the combination of a value sent at such a point with a value in the smae region accessed later in the function, highlighting the point at which the value sent allows the programmer to continue to focus their debugging efforts largely on the points at which concurrency communication is performed. In line with this reasoning, the `SendNonSendable` implementation instead emits diagnostics like the following:
 
 ```swift
 func giveBoxToActor(a : MyActor) async {
@@ -294,7 +342,7 @@ func compareListElems(a : MyActor) async {
 }
 ```
 
-There is one other category of diagnostic emitted by this pass. As described in the [section above](#regionrules), the default function convention assumes that functions do not consume the regions of their arguments (including `self`). Thus making an isolation-crossing call passing any non-sendable values in the same region as a non-sendable `self` value, or any non-sendable args, will be an error.
+There is one other category of diagnostic emitted by this pass. As described in the [section above](#regionrules), the default function convention assumes that functions do not transfer the regions of their arguments (including `self`). Thus making an isolation-crossing call passing any non-sendable values in the same region as a non-sendable `self` value, or any non-sendable args, will be an error.
 
 <a name="passtoactor"></a>
 
@@ -310,7 +358,7 @@ As the diagnostic message indicates, this warning is necessary because function 
 func genAndPassTo(a : MyActor) async {
   let v = NonSendableValue()
   
-  // call does NOT consume v
+  // call does NOT transfer v
   await passToActor(a, v)
   
   // access here allowed
@@ -322,31 +370,33 @@ To allow the function `passToActor` above to typecheck, a `consuming`-style anno
 
 ### At an implementation level
 
-`SendNonSendable` is implemented as a raw SIL pass. The SIL pass performs a flow-sensitive, intraprocedural analysis for each function body that assigns a partition to the non-sendable values in scope at each point in its body. This partition groups the values into regions, with some values grouped into the special "consumed" region indicating that their region was consumed by an isolation-crossing application and can no longer be accessed. Only values that have been initialized by a given program point are tracked in the partition for that program point. Each SIL instruction is mapped to an operation on these partitions that manipulates the set of tracked values and their assignments to regions. Each operation takes arguments, whose values are not directly SILValues but rather a parallel set of values referred to in the code as `TrackableSILValue`s. The `SendNonSendable` pass maps each SILValue to a `TrackableSILValue`, often mapping two SILValues to the same `TrackableSILValue` if one is a projection of the other or refers to the same underlying storage. To indicate this layer of indirection `%%` (double percentage signs) are used to indicate `TrackableSILValue`s.
+// TODO : this section is too detailed for the proposal, move it to a separate doc
+
+`SendNonSendable` is implemented as a raw SIL pass. The SIL pass performs a flow-sensitive, intraprocedural analysis for each function body that assigns a partition to the non-sendable values in scope at each point in its body. This partition groups the values into regions, with some values grouped into the special "transferred" region indicating that their region was transferred by an isolation-crossing application and can no longer be accessed. Only values that have been initialized by a given program point are tracked in the partition for that program point. Each SIL instruction is mapped to an operation on these partitions that manipulates the set of tracked values and their assignments to regions. Each operation takes arguments, whose values are not directly SILValues but rather a parallel set of values referred to in the code as `TrackableSILValue`s. The `SendNonSendable` pass maps each SILValue to a `TrackableSILValue`, often mapping two SILValues to the same `TrackableSILValue` if one is a projection of the other or refers to the same underlying storage. To indicate this layer of indirection `%%` (double percentage signs) are used to indicate `TrackableSILValue`s.
 
 There are 5 operations on partitions that source SILInstructions get translated to:
 
 - `Assign %%0 = %%1`
-  Before this operation, `%%1` must already be tracked by the partition, and assigned to a non-consumed region. `%%0` need not be tracked or non-consumed if it is tracked. After this operation, `%%1`'s assignment in the partition will not change, and `%%0` will be tracked and assigned to the same region as %%1.
+  Before this operation, `%%1` must already be tracked by the partition, and assigned to a non-transferred region. `%%0` need not be tracked or non-transferred if it is tracked. After this operation, `%%1`'s assignment in the partition will not change, and `%%0` will be tracked and assigned to the same region as %%1.
 
 - `AssignFresh %%0`
-  Before this operation, `%%0` need not be tracked or non-consumed if it is tracked. After this operation, `%%0` will be assigned to a region that no other values in the partition are assigned to.
+  Before this operation, `%%0` need not be tracked or non-transferred if it is tracked. After this operation, `%%0` will be assigned to a region that no other values in the partition are assigned to.
 
-- `Consume %%0`
-  Before this operation, `%%0` must be tracked by the partition but may or may not be consumed. After this operation, `%%0` will be marked as consumed in the partition. If `%%0` was assigned to a non-consumed region before the operation, then all other values in that region will also be marked as consumed after the operation.
+- `Transfer %%0`
+  Before this operation, `%%0` must be tracked by the partition but may or may not be transferred. After this operation, `%%0` will be marked as transferred in the partition. If `%%0` was assigned to a non-transferred region before the operation, then all other values in that region will also be marked as transferred after the operation.
 
 - `Merge %%0 with %%1`
-  Before this operation, both `%%0` and `%%1` must be tracked and assigned to non-consumed regions. After this operation, all values in both of those regions will be assigned to a single, non-consumed region.
+  Before this operation, both `%%0` and `%%1` must be tracked and assigned to non-transferred regions. After this operation, all values in both of those regions will be assigned to a single, non-transferred region.
 
 - `Require %%0`
-  Before this operation, `%%0` must be tracked and assigned to a non-consumed region. This operation has no effect on the partition.
+  Before this operation, `%%0` must be tracked and assigned to a non-transferred region. This operation has no effect on the partition.
 
 TODO: add examples of SILInstructions that translate to each PartititonOp
 
-At entry to a function body, `self` (if non-sendable) and all non-sendable arguments are assigned to a single, non-consumed region. Using fixpoint iteration, partitions are then computed at entry and exit to each basic block of the function that satisfy two properties:
+At entry to a function body, `self` (if non-sendable) and all non-sendable arguments are assigned to a single, non-transferred region. Using fixpoint iteration, partitions are then computed at entry and exit to each basic block of the function that satisfy two properties:
 
 1. Applying all operations of a basic block, in order, to its entry partition yields its exit partition
-2. Each entry partition is the "join" of the exit partitions of each predecessor to its basic basic block. The join of a set of partitions is the finest partition in which any two values that are assigned to the same region in some partition in the set are assigned to the same region, and all values that are consumed in some partition in the set are consumed.
+2. Each entry partition is the "join" of the exit partitions of each predecessor to its basic basic block. The join of a set of partitions is the finest partition in which any two values that are assigned to the same region in some partition in the set are assigned to the same region, and all values that are transferred in some partition in the set are transferred.
 
 Once these partitions are computed, the preconditions of each operations can be checked against them, and diagnostics are reported if they do not hold.
 
@@ -356,7 +406,7 @@ All previously valid, well-typed Swift code will still be valid, well-typed Swif
 
 ## ABI compatibility
 
-No currently planned ABI changes, except as indicated above to potentially change the signatures of functions like `MainActor.run`. In the future, we could possibly have to add more information to function signatures to support more general operations on the region partition, such as ensuring that result values from functions come from fresh regions or the regions of arguments; or allowing two arguments to a class method to come from a region distinct from `self` but the same as each other.
+No currently planned ABI changes, except as indicated above to potentially change the signatures of functions like `MainActor.run`, which should be possible to do without an ABI break. In the future, we could possibly have to add more information to function signatures to support more general operations on the region partition, such as ensuring that result values from functions come from fresh regions or the regions of arguments; or allowing two arguments to a class method to come from a region distinct from `self` but the same as each other.
 
 ## Implications on adoption
 
@@ -366,7 +416,7 @@ The `SendNonSendable` pass, if adopted, would encourage the development of libra
 
 ### <a name="consumingargs"></a>Consuming args
 
-In the current implementation of `SendNonSendable`, functions cannot consume their arguments. This greatly constricts allowed programming patterns. To send a value to another isolation domain, that value *must* have been initialized locally, not read from an argument or from `self`'s storage. Allowing values from `self`'s storage to be safely sent to other threads is the subject of the `iso` fields extension (discussed below)[#iso] and is a bit involved, but allowing arguments to be sent (i.e. consumed), is much simpler. All that is necessary is to add a `consuming` annotation to function signatures that indicates that certain arguments could be consumed by the end of the function body. As a simplest example, the following code shows the behavior of the `consuming` annotation:
+In the current implementation of `SendNonSendable`, functions cannot transfer their arguments. This greatly constricts allowed programming patterns. To send a value to another isolation domain, that value *must* have been initialized locally, not read from an argument or from `self`'s storage. Allowing values from `self`'s storage to be safely sent to other threads is the subject of the `iso` fields extension (discussed below)[#iso] and is a bit involved, but allowing arguments to be sent (i.e. transferred), is much simpler. All that is necessary is to add a `consuming` annotation to function signatures that indicates that certain arguments could be transferred by the end of the function body. As a simplest example, the following code shows the behavior of the `consuming` annotation:
 
 ```swift
 func passToActorConsuming(a : MyActor, consuming v : NonSendableValue) async {
@@ -376,7 +426,7 @@ func passToActorConsuming(a : MyActor, consuming v : NonSendableValue) async {
 func genAndPassToConsuming(a : MyActor) async {
   let v = NonSendableValue()
   
-  // call consumes v
+  // call transfers v
   await passToActorConsuming(a, v)
   
   // access here NOT allowed
@@ -386,13 +436,13 @@ func genAndPassToConsuming(a : MyActor) async {
 
 Unlike the prior function `passToActor` (defined above)[#passtoactor], `passToActorConsuming` *does* typecheck now, but `genAndPassToConsuming` does not - the inverse situation of the non-consuming functions.
 
-`consuming` parameters are a very natural programming pattern. Without them, it is only possible for non-sendable values to ever make a single hop between domains. They are also very easy to implement, and might even be done so before the acceptance of this proposal. The largest difficulty with the addition of this feature is ergonomic interplay with the existing `consuming` annotation that exists in the Swift language. The existing `consuming` keyword focuses on non-copyable types - and specifies ownership conventions for handling refcounts and deallocation. This is related to the idea of `consuming` needed by `SendNonSendable`(let's call it `region-consuming` for now), and in fact, any case in which a parameter is `region-consuming`, it should also be `consuming` (in the existing Swift, non-copyable, sense). Unfortunately, the converse does not hold. For example, parameters to initializers and setters are usually `consuming`, but they should not be `region-consuming`. The reason for this is that the region-based typechecking of `SendNonSendable` is able to track the fact that by passing values to a setter or initializer, ownership has been transferred, but to a known target: the region of `self` of the called method. Thus by not marking such parameters as `region-consuming`, they can still be used after being passed to a setter or initializer as long as the set or initialized value is not consumed. If all such methods' parameters were `region-consuming`, then even if `self` were not consumed, the arguments to the methods would not be accessible after the call.
+`consuming` parameters are a very natural programming pattern. Without them, it is only possible for non-sendable values to ever make a single hop between domains. They are also very easy to implement, and might even be done so before the acceptance of this proposal. The largest difficulty with the addition of this feature is ergonomic interplay with the existing `consuming` annotation that exists in the Swift language. The existing `consuming` keyword focuses on non-copyable types - and specifies ownership conventions for handling refcounts and deallocation. This is related to the idea of `consuming` needed by `SendNonSendable`(let's call it `region-consuming` for now), and in fact, any case in which a parameter is `region-consuming`, it should also be `consuming` (in the existing Swift, non-copyable, sense). Unfortunately, the converse does not hold. For example, parameters to initializers and setters are usually `consuming`, but they should not be `region-consuming`. The reason for this is that the region-based typechecking of `SendNonSendable` is able to track the fact that by passing values to a setter or initializer, ownership has been transferred, but to a known target: the region of `self` of the called method. Thus by not marking such parameters as `region-consuming`, they can still be used after being passed to a setter or initializer as long as the set or initialized value is not transferred. If all such methods' parameters were `region-consuming`, then even if `self` were not transferred, the arguments to the methods would not be accessible after the call.
 
-It is worth noting that for any methods meant to be called only in isolation-crossing contexts, it is a strict gain of expressivity to mark their non-sendable arguments as `consuming`; at callsites, consumption is enforced anyways, and within the function body, the freedom to consume the arguments again by passing to a third isolation domain would be attained. This provides further evidence that exposing it as an annotation would be useful.
+It is worth noting that for any methods meant to be called only in isolation-crossing contexts, it is a strict gain of expressivity to mark their non-sendable arguments as `consuming`; at callsites, consumption is enforced anyways, and within the function body, the freedom to transfer the arguments again by passing to a third isolation domain would be attained. This provides further evidence that exposing it as an annotation would be useful.
 
 To concretely illustrate the semantics of this extension, `consuming` parameters would:
 
-- consume the regions of their non-sendable arguments at callsites *whether or not* the callsite is isolation-crossing (in contrast to non-`consuming` parameters that only consume their arguments' regions if the callsite is isolation-crossing)
+- transfer the regions of their non-sendable arguments at callsites *whether or not* the callsite is isolation-crossing (in contrast to non-`consuming` parameters that only transfer their arguments' regions if the callsite is isolation-crossing)
 - be allocated separate regions from `self` and all other arguments in the region partition used at the entry to function bodies.
 
 It is of note that there is technically an even more general approach that expands on the second point of semantics above by allowing two `consuming` parameters to be assumed to come from the same region as each other. Without this feature, `consuming` parameters would always have to be passed values known to be in a separate region from all other arguments at the callsite. With this feature, two values that are possibly aliases of each other, or possibly reference each other, could be passed to two `consuming` arguments. The benefits of this further extension are less concrete that `consuming` itself, so it is not likely this will be introduced soon.
