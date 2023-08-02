@@ -122,8 +122,8 @@ func computeAndDisplayLargest(datasets : [LocationData]) async {
     listOfGraphs.append(computeNearestNeighbors(data : data))
   }
   
-  let largestGraph = listOfViews.max(by: { $0.numRootPoints() > $1.numRootPoints() })
-  let smallestGraph = listOfViews.min(by: { $0.numRootPoints() > $1.numRootPoints() })
+  let largestGraph = listOfGraphs.max(by: { $0.numRootPoints() > $1.numRootPoints() })
+  let smallestGraph = listOfGraphs.min(by: { $0.numRootPoints() > $1.numRootPoints() })
   
   await addToDisplay(largestGraph)
   
