@@ -461,9 +461,15 @@ actor IndecisiveBox {
 
 This could be a perfectly safe pattern, but in the current `SendNonSendable` pass will produce diagnostics as shown above. The issue is that it is not statically known that it is safe to send `contents` to another thread while continuing to access the rest of the actor's storage. To this end, the system could introduce the `iso` keyword. 
 
-TODO: expand on this section.
+The `iso` keyword, when placed on fields, for example as `iso var contents : NonSendable` above, would indicate that instead of tracking the source and target of the reference (here, `self` and `self.contents`) as necessarily belonging to the same region, they could belong to *different* regions. This allows the above code to typecheck, but comes at the cost of greater complexity to the analysis. For more details see (the PLDI paper)[https://www.cs.cornell.edu/andru/papers/gallifrey-types/].
+
+### Global actors
+
+Global actors can have state in the form of actor-isolated global variables. Unlike non-isolated global variables, global actor isolated variables will be able to safely be non-sendable, but they need to be modelled as residing in a `self`-like region dedicate to that global actor in functions isolated to the global actor. This will ensure that non-sendable values read from global actor isolated state cannot be sent to another isolation domain, and, via the region mechanim, that any values that could reference or alias global actor isolated state cannot be sent to another isolation domain
 
 ### Async let, and task completion
+
+When structured tasks or statements executed with `async let` complete, not just their possibly non-sendable result but any non-sendable values captured by them should become accessible to the caller. This is not yet implemented.
 
 ## Alternatives considered
 
@@ -477,4 +483,4 @@ TODO: expand on this section.
 
 ## Acknowledgments
 
-This proposal is based on joint work with Mae Milano and Andrew Myers, published in the PLDI 2022 paper "A Flexible Type System for Fearless Concurrency". Doug Gregor and Kavon Farvardin assisted with the development of the `SendNonSendable` implementation and this proposal as well.
+This proposal is based on joint work with Mae Milano and Andrew Myers, published in the PLDI 2022 paper (A Flexible Type System for Fearless Concurrency)[https://www.cs.cornell.edu/andru/papers/gallifrey-types/]. Doug Gregor and Kavon Farvardin assisted with the development of the `SendNonSendable` implementation and this proposal as well.
