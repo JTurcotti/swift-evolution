@@ -277,7 +277,7 @@ On the other hand, the call to `admitVisitor` in the nonisolated function `visit
 
 #### Task creation
 
-Special functions that create new tasks, such as `Task.init` or `Task.detached`, or functions that otherwise cause passed closures to execute concurrently with the caller such as `MainActor.run`, must also transfer their argument. In particular, the argument will be a closure, so any values captured in the closure will be in the same region as that closure, and consuming it will transfer those values. This consumption prevents races on those values between the caller and the executor of the passed closure. This prevents the following possible racy code from being expressible as well:
+Special functions that create new tasks, such as `Task.init` or `Task.detached`, or functions that otherwise cause passed closures to execute concurrently with the caller such as `MainActor.run`, must also transfer their argument. In particular, the argument will be a closure, so any values captured in the closure will be in the same region as that closure, and transferring it will transfer those values. This transfer prevents races on those values between the caller and the executor of the passed closure. This prevents the following possible racy code from being expressible as well:
 
 ```swift
 func visitParksParallel(_ parks : [NationalPark], _ visitorName : String) {
@@ -366,39 +366,7 @@ func genAndPassTo(a : MyActor) async {
 }
 ```
 
-To allow the function `passToActor` above to typecheck, a `consuming`-style annotation is needed. See the section [Consuming args](#consumingargs) below.
-
-### At an implementation level
-
-// TODO : this section is too detailed for the proposal, move it to a separate doc
-
-`SendNonSendable` is implemented as a raw SIL pass. The SIL pass performs a flow-sensitive, intraprocedural analysis for each function body that assigns a partition to the non-sendable values in scope at each point in its body. This partition groups the values into regions, with some values grouped into the special "transferred" region indicating that their region was transferred by an isolation-crossing application and can no longer be accessed. Only values that have been initialized by a given program point are tracked in the partition for that program point. Each SIL instruction is mapped to an operation on these partitions that manipulates the set of tracked values and their assignments to regions. Each operation takes arguments, whose values are not directly SILValues but rather a parallel set of values referred to in the code as `TrackableSILValue`s. The `SendNonSendable` pass maps each SILValue to a `TrackableSILValue`, often mapping two SILValues to the same `TrackableSILValue` if one is a projection of the other or refers to the same underlying storage. To indicate this layer of indirection `%%` (double percentage signs) are used to indicate `TrackableSILValue`s.
-
-There are 5 operations on partitions that source SILInstructions get translated to:
-
-- `Assign %%0 = %%1`
-  Before this operation, `%%1` must already be tracked by the partition, and assigned to a non-transferred region. `%%0` need not be tracked or non-transferred if it is tracked. After this operation, `%%1`'s assignment in the partition will not change, and `%%0` will be tracked and assigned to the same region as %%1.
-
-- `AssignFresh %%0`
-  Before this operation, `%%0` need not be tracked or non-transferred if it is tracked. After this operation, `%%0` will be assigned to a region that no other values in the partition are assigned to.
-
-- `Transfer %%0`
-  Before this operation, `%%0` must be tracked by the partition but may or may not be transferred. After this operation, `%%0` will be marked as transferred in the partition. If `%%0` was assigned to a non-transferred region before the operation, then all other values in that region will also be marked as transferred after the operation.
-
-- `Merge %%0 with %%1`
-  Before this operation, both `%%0` and `%%1` must be tracked and assigned to non-transferred regions. After this operation, all values in both of those regions will be assigned to a single, non-transferred region.
-
-- `Require %%0`
-  Before this operation, `%%0` must be tracked and assigned to a non-transferred region. This operation has no effect on the partition.
-
-TODO: add examples of SILInstructions that translate to each PartititonOp
-
-At entry to a function body, `self` (if non-sendable) and all non-sendable arguments are assigned to a single, non-transferred region. Using fixpoint iteration, partitions are then computed at entry and exit to each basic block of the function that satisfy two properties:
-
-1. Applying all operations of a basic block, in order, to its entry partition yields its exit partition
-2. Each entry partition is the "join" of the exit partitions of each predecessor to its basic basic block. The join of a set of partitions is the finest partition in which any two values that are assigned to the same region in some partition in the set are assigned to the same region, and all values that are transferred in some partition in the set are transferred.
-
-Once these partitions are computed, the preconditions of each operations can be checked against them, and diagnostics are reported if they do not hold.
+To allow the function `passToActor` above to typecheck, a `transferring`-style annotation is needed. See the section [Transferring args](#transferringargs) below.
 
 ## Source compatibility
 
@@ -414,38 +382,38 @@ The `SendNonSendable` pass, if adopted, would encourage the development of libra
 
 ## Future directions
 
-### <a name="consumingargs"></a>Consuming args
+### <a name="transferringargs"></a>Transferring args
 
-In the current implementation of `SendNonSendable`, functions cannot transfer their arguments. This greatly constricts allowed programming patterns. To send a value to another isolation domain, that value *must* have been initialized locally, not read from an argument or from `self`'s storage. Allowing values from `self`'s storage to be safely sent to other threads is the subject of the `iso` fields extension (discussed below)[#iso] and is a bit involved, but allowing arguments to be sent (i.e. transferred), is much simpler. All that is necessary is to add a `consuming` annotation to function signatures that indicates that certain arguments could be transferred by the end of the function body. As a simplest example, the following code shows the behavior of the `consuming` annotation:
+In the current implementation of `SendNonSendable`, functions cannot transfer their arguments. This greatly constricts allowed programming patterns. To send a value to another isolation domain, that value *must* have been initialized locally, not read from an argument or from `self`'s storage. Allowing values from `self`'s storage to be safely sent to other threads is the subject of the `iso` fields extension (discussed below)[#iso] and is a bit involved, but allowing arguments to be sent (i.e. transferred), is much simpler. All that is necessary is to add a `transferring` annotation to function signatures that indicates that certain arguments could be transferred by the end of the function body. As a simplest example, the following code shows the behavior of the `transferring` annotation:
 
 ```swift
-func passToActorConsuming(a : MyActor, consuming v : NonSendableValue) async {
+func passToActorTransferring(a : MyActor, transferring v : NonSendableValue) async {
   await a.foo(v)
 }
 
-func genAndPassToConsuming(a : MyActor) async {
+func genAndPassTransferring(a : MyActor) async {
   let v = NonSendableValue()
   
   // call transfers v
-  await passToActorConsuming(a, v)
+  await passToActorTransferring(a, v)
   
   // access here NOT allowed
   print(v)
 }
 ```
 
-Unlike the prior function `passToActor` (defined above)[#passtoactor], `passToActorConsuming` *does* typecheck now, but `genAndPassToConsuming` does not - the inverse situation of the non-consuming functions.
+Unlike the prior function `passToActor` (defined above)[#passtoactor], `passToActorTransferring` *does* typecheck now, but `genAndPassToTransferring` does not - the inverse situation of the non-transferring functions.
 
-`consuming` parameters are a very natural programming pattern. Without them, it is only possible for non-sendable values to ever make a single hop between domains. They are also very easy to implement, and might even be done so before the acceptance of this proposal. The largest difficulty with the addition of this feature is ergonomic interplay with the existing `consuming` annotation that exists in the Swift language. The existing `consuming` keyword focuses on non-copyable types - and specifies ownership conventions for handling refcounts and deallocation. This is related to the idea of `consuming` needed by `SendNonSendable`(let's call it `region-consuming` for now), and in fact, any case in which a parameter is `region-consuming`, it should also be `consuming` (in the existing Swift, non-copyable, sense). Unfortunately, the converse does not hold. For example, parameters to initializers and setters are usually `consuming`, but they should not be `region-consuming`. The reason for this is that the region-based typechecking of `SendNonSendable` is able to track the fact that by passing values to a setter or initializer, ownership has been transferred, but to a known target: the region of `self` of the called method. Thus by not marking such parameters as `region-consuming`, they can still be used after being passed to a setter or initializer as long as the set or initialized value is not transferred. If all such methods' parameters were `region-consuming`, then even if `self` were not transferred, the arguments to the methods would not be accessible after the call.
+`transferring` parameters are a very natural programming pattern. Without them, it is only possible for non-sendable values to ever make a single hop between domains. They are also very easy to implement, and might even be done so before the acceptance of this proposal. The largest difficulty with the addition of this feature is ergonomic interplay with the existing `transferring` annotation that exists in the Swift language. The existing `transferring` keyword focuses on non-copyable types - and specifies ownership conventions for handling refcounts and deallocation. This is related to the idea of `transferring` needed by `SendNonSendable`(let's call it `region-transferring` for now), and in fact, any case in which a parameter is `region-transferring`, it should also be `transferring` (in the existing Swift, non-copyable, sense). Unfortunately, the converse does not hold. For example, parameters to initializers and setters are usually `transferring`, but they should not be `region-transferring`. The reason for this is that the region-based typechecking of `SendNonSendable` is able to track the fact that by passing values to a setter or initializer, ownership has been transferred, but to a known target: the region of `self` of the called method. Thus by not marking such parameters as `region-transferring`, they can still be used after being passed to a setter or initializer as long as the set or initialized value is not transferred. If all such methods' parameters were `region-transferring`, then even if `self` were not transferred, the arguments to the methods would not be accessible after the call.
 
-It is worth noting that for any methods meant to be called only in isolation-crossing contexts, it is a strict gain of expressivity to mark their non-sendable arguments as `consuming`; at callsites, consumption is enforced anyways, and within the function body, the freedom to transfer the arguments again by passing to a third isolation domain would be attained. This provides further evidence that exposing it as an annotation would be useful.
+It is worth noting that for any methods meant to be called only in isolation-crossing contexts, it is a strict gain of expressivity to mark their non-sendable arguments as `transferring`; at callsites, transferance is enforced anyways, and within the function body, the freedom to transfer the arguments again by passing to a third isolation domain would be attained. This provides further evidence that exposing it as an annotation would be useful.
 
-To concretely illustrate the semantics of this extension, `consuming` parameters would:
+To concretely illustrate the semantics of this extension, `transferring` parameters would:
 
-- transfer the regions of their non-sendable arguments at callsites *whether or not* the callsite is isolation-crossing (in contrast to non-`consuming` parameters that only transfer their arguments' regions if the callsite is isolation-crossing)
+- transfer the regions of their non-sendable arguments at callsites *whether or not* the callsite is isolation-crossing (in contrast to non-`transferring` parameters that only transfer their arguments' regions if the callsite is isolation-crossing)
 - be allocated separate regions from `self` and all other arguments in the region partition used at the entry to function bodies.
 
-It is of note that there is technically an even more general approach that expands on the second point of semantics above by allowing two `consuming` parameters to be assumed to come from the same region as each other. Without this feature, `consuming` parameters would always have to be passed values known to be in a separate region from all other arguments at the callsite. With this feature, two values that are possibly aliases of each other, or possibly reference each other, could be passed to two `consuming` arguments. The benefits of this further extension are less concrete that `consuming` itself, so it is not likely this will be introduced soon.
+It is of note that there is technically an even more general approach that expands on the second point of semantics above by allowing two `transferring` parameters to be assumed to come from the same region as each other. Without this feature, `transferring` parameters would always have to be passed values known to be in a separate region from all other arguments at the callsite. With this feature, two values that are possibly aliases of each other, or possibly reference each other, could be passed to two `transferring` arguments. The benefits of this further extension are less concrete that `transferring` itself, so it is not likely this will be introduced soon.
 
 ### Returning fresh
 
@@ -463,7 +431,7 @@ func generateFreshPerson(_ name : String, _ age : Int, _ ancestryMap : AncestryM
 This code basically wraps an initializer with extra logic, and aims to return a non-sendable result to the caller in a fresh region. Unfortunately, the current `SendNonSendable` pass does not allow its result to be used. A useful extension would allow functions with non-sendable results to allow those results to be accessible to cross-isolation callers in the following cases:
 
 - For methods that are not actor methods, the result of isolation-crossing calls to those methods are always available to the caller. 
-  - By default, results are provided in the same region as `self` and any other arguments (except `consuming` arguments (see above)[#consumingargs])
+  - By default, results are provided in the same region as `self` and any other arguments (except `transferring` arguments (see above)[#transferringargs])
   - If the `fresh` keyword is placed on the result type in the function signature (e.g. `func generateFreshPerson(...) -> fresh Person`), then the result is provided in a fresh region
 - For actor methods:
   -  If the result is not annotated with the `fresh` keyword, then it is never accessible to cross-isolation callers, as the result is in the same region as actor-isolated storage, which is not accessible to the caller.'
