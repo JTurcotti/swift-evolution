@@ -296,7 +296,7 @@ User-defined functions that takes non-sendable closures should not, in general, 
 1. Hard-code a list of such functions - possible but likely considered bad practice
 2. Mark such functions with an annotation such as `@IsolationCrossing` at the source level where they're defined. 
 
-Additionally, to achieve the desired level of expressivity, it will be necessary to *remove* the source-level `@Sendable` annotation on the types of the arguments to these functions. Without the introduction of the `SendNonSendable` pass, race-freedom is attained for functions such as `Task.detached` only by ensuring they only take `@Sendable` args. This prevents entirely the passing of closures that capture non-sendable values to these functions (as such closures are necessarily `@Sendable`). By implementing the `SendNonSendable` pass, sendable closures will still be able to be passed freely to these functions, but non-sendable closures will not be outright banned - rather they will be subject to the same flow-sensitive region-base checking as all other non-sendable values passed to isolation-crossing calls: if their region has not been transferred the call will be allowed, and otherwise it will throw an error. This change (removing `@Sendable` from the argument signatures of these functions) is necessary.
+Additionally, to achieve the desired level of expressivity, it will be necessary to *remove* the source-level `@Sendable` annotation on the types of the arguments to these functions. Without the introduction of the `SendNonSendable` pass, race-freedom is attained for functions such as `Task.detached` only by ensuring they only take `@Sendable` args. This prevents entirely the passing of closures that capture non-sendable values to these functions (as such closures are necessarily `@Sendable`). By implementing the `SendNonSendable` pass, sendable closures will still be able to be passed freely to these functions, but non-sendable closures will not be outright banned - rather they will be subject to the same flow-sensitive region-based checking as all other non-sendable values passed to isolation-crossing calls: if their region has not been transferred the call will be allowed, and otherwise it will throw an error. This change (removing `@Sendable` from the argument signatures of these functions) is necessary.
 
 ### Diagnostics
 
@@ -379,6 +379,8 @@ No currently planned ABI changes, except as indicated above to potentially chang
 ## Implications on adoption
 
 The `SendNonSendable` pass, if adopted, would encourage the development of libraries that pervasively use Swift concurrency, but do not enforce sendability on all types communicated between isolation domains. This is a large expressivity win, but could fundamentally change the way libraries are written, and this have a large impact if the feature were adopted then rolled back. 
+
+Additioanlly, API designers will have to expect that, by default, values of types they define can be used in a concurrent context; sending them between isolation domains. If they want to be able to maintain the ability to explicitly declare that values of their types can never cross isolations, an [additional language feature would be required](#sendableunavailability).
 
 ## Future directions
 
@@ -470,6 +472,21 @@ Global actors can have state in the form of actor-isolated global variables. Unl
 ### Async let, and task completion
 
 When structured tasks or statements executed with `async let` complete, not just their possibly non-sendable result but any non-sendable values captured by them should become accessible to the caller. This is not yet implemented.
+
+### <a name="sendableunavailability"></a>`Sendable` unavailability
+
+Current `Sendable` checking allows for the following declaration:
+
+```swift
+@available(*, unavailable)
+extension T: Sendable { }
+```
+
+This ensures that `T` will never be `Sendable`, and allows API designers to express a constraint that values of type `T` should never become available in any isolation domain except the one they were created in. With the introduction of the `SendNonSendable` pass, declaring the `Sendable` protocol `unavailable` for a type will still have the effect of preventing it from being made to confom to `Sendable`, and thus preventing values of that type from being sent without using the `SendNonSendable` pass to ensure no aliases of the value linger, but it will not have the effect of ouright preventing values from being sent. 
+
+It could potentially be useful to still expose a way for developers to ensure values of their defined types are never able to be sent, which would involve a new annotation or protocol such as `~Transferrable` or `~Sendable`. Values of such types would still need to be tracked, as their region labels are necessary to ensure closure under aliasing and references still holds for the regions of non-annotated values, but at the point of a send between isolations, attempting to send any `~Transferable` type would always yield a diagnostic.
+
+It is worth evaluating whether this language feature is actually something developers would find useful/should use; what are the concrete use cases?
 
 ## Alternatives considered
 
