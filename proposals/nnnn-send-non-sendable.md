@@ -277,7 +277,7 @@ On the other hand, the call to `admitVisitor` in the nonisolated function `visit
 
 #### Task creation
 
-Special functions that create new tasks, such as `Task.init` or `Task.detached`, or functions that otherwise cause passed closures to execute concurrently with the caller such as `MainActor.run`, must also transfer their argument. In particular, the argument will be a closure, so any values captured in the closure will be in the same region as that closure, and transferring it will transfer those values. This transfer prevents races on those values between the caller and the executor of the passed closure. This prevents the following possible racy code from being expressible as well:
+Special functions that create new tasks, such as `Task.init`, `Task.detached`, or `TaskGroup.addTask`, or functions that otherwise cause passed closures to execute concurrently with the caller such as `MainActor.run`, must also transfer their argument. In particular, the argument will be a closure, so any values captured in the closure will be in the same region as that closure, and transferring it will transfer those values. This transfer prevents races on those values between the caller and the executor of the passed closure. This prevents the following possible racy code from being expressible as well:
 
 ```swift
 func visitParksParallel(_ parks : [NationalPark], _ visitorName : String) {
@@ -291,10 +291,13 @@ func visitParksParallel(_ parks : [NationalPark], _ visitorName : String) {
 }
 ```
 
-User-defined functions that takes non-sendable closures should not, in general, exhibit isolation-crossing semantics and transfer their arguments, so it will be necessary to inform the `SendNonSendable` analysis of the special functions such as `Task.init`, `Task.detached`, and `MainActor.run` that execute their passed closure under different isolation than or concurrently with the caller. Two possible approaches for this are:
+User-defined functions that takes non-sendable closures should not, in general, exhibit isolation-crossing semantics and transfer their arguments, so it will be necessary to inform the `SendNonSendable` analysis of the special functions such as `Task.init`, `Task.detached`, and `MainActor.run` that execute their passed closure under different isolation than or concurrently with the caller. Three possible approaches for this are:
 
 1. Hard-code a list of such functions - possible but likely considered bad practice
-2. Mark such functions with an annotation such as `@IsolationCrossing` at the source level where they're defined. 
+2. Mark such functions with an annotation such as `@IsolationCrossing` at the source level where they're defined - desirable only if [transferring](#transferringargs) is unsupported
+3. Use the [transferring](#transferringargs) qualifier on the arguments to such functions to enforce transferrance of their arguments at the calcite
+
+These approaches are listed in increasing order of desirability. Implementing the `transferring` arg qualifier and adding it to the signatures of these functions is the best solution, and indeed the only one in which the implementations of these library functions themselves will typecheck. An attribute such as `@IsolationCrossing` could be used in lieu of the `transferring` feature, but would require some care to make it seem natural and play nicely with other available attributes.
 
 Additionally, to achieve the desired level of expressivity, it will be necessary to *remove* the source-level `@Sendable` annotation on the types of the arguments to these functions. Without the introduction of the `SendNonSendable` pass, race-freedom is attained for functions such as `Task.detached` only by ensuring they only take `@Sendable` args. This prevents entirely the passing of closures that capture non-sendable values to these functions (as such closures are necessarily `@Sendable`). By implementing the `SendNonSendable` pass, sendable closures will still be able to be passed freely to these functions, but non-sendable closures will not be outright banned - rather they will be subject to the same flow-sensitive region-based checking as all other non-sendable values passed to isolation-crossing calls: if their region has not been transferred the call will be allowed, and otherwise it will throw an error. This change (removing `@Sendable` from the argument signatures of these functions) is necessary.
 
