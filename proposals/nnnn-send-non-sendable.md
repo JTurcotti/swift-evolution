@@ -389,7 +389,7 @@ Additioanlly, API designers will have to expect that, by default, values of type
 
 ### <a name="transferringargs"></a>Transferring args
 
-In the current implementation of `SendNonSendable`, functions cannot transfer their arguments. This greatly constricts allowed programming patterns. To send a value to another isolation domain, that value *must* have been initialized locally, not read from an argument or from `self`'s storage. Allowing values from `self`'s storage to be safely sent to other threads is the subject of the `iso` fields extension (discussed below)[#iso] and is a bit involved, but allowing arguments to be sent (i.e. transferred), is much simpler. All that is necessary is to add a `transferring` annotation to function signatures that indicates that certain arguments could be transferred by the end of the function body. As a simplest example, the following code shows the behavior of the `transferring` annotation:
+In the current implementation of `SendNonSendable`, functions cannot transfer their arguments. This greatly constricts allowed programming patterns. To send a value to another isolation domain, that value *must* have been initialized locally, not read from an argument or from `self`'s storage. Allowing values from `self`'s storage to be safely sent to other threads is the subject of the `iso` fields extension [discussed below](#iso) and is a bit involved, but allowing arguments to be sent (i.e. transferred), is much simpler. All that is necessary is to add a `transferring` annotation to function signatures that indicates that certain arguments could be transferred by the end of the function body. As a simplest example, the following code shows the behavior of the `transferring` annotation:
 
 ```swift
 func passToActorTransferring(a : MyActor, transferring v : NonSendableValue) async {
@@ -407,7 +407,7 @@ func genAndPassTransferring(a : MyActor) async {
 }
 ```
 
-Unlike the prior function `passToActor` (defined above)[#passtoactor], `passToActorTransferring` *does* typecheck now, but `genAndPassToTransferring` does not - the inverse situation of the non-transferring functions.
+Unlike the prior function `passToActor` [defined above](#passtoactor), `passToActorTransferring` *does* typecheck now, but `genAndPassToTransferring` does not - the inverse situation of the non-transferring functions.
 
 `transferring` parameters are a very natural programming pattern. Without them, it is only possible for non-sendable values to ever make a single hop between domains. They are also very easy to implement, and might even be done so before the acceptance of this proposal. The largest difficulty with the addition of this feature is ergonomic interplay with the existing `transferring` annotation that exists in the Swift language. The existing `transferring` keyword focuses on non-copyable types - and specifies ownership conventions for handling refcounts and deallocation. This is related to the idea of `transferring` needed by `SendNonSendable`(let's call it `region-transferring` for now), and in fact, any case in which a parameter is `region-transferring`, it should also be `transferring` (in the existing Swift, non-copyable, sense). Unfortunately, the converse does not hold. For example, parameters to initializers and setters are usually `transferring`, but they should not be `region-transferring`. The reason for this is that the region-based typechecking of `SendNonSendable` is able to track the fact that by passing values to a setter or initializer, ownership has been transferred, but to a known target: the region of `self` of the called method. Thus by not marking such parameters as `region-transferring`, they can still be used after being passed to a setter or initializer as long as the set or initialized value is not transferred. If all such methods' parameters were `region-transferring`, then even if `self` were not transferred, the arguments to the methods would not be accessible after the call.
 
@@ -436,7 +436,7 @@ func generateFreshPerson(_ name : String, _ age : Int, _ ancestryMap : AncestryM
 This code basically wraps an initializer with extra logic, and aims to return a non-sendable result to the caller in a fresh region. Unfortunately, the current `SendNonSendable` pass does not allow its result to be used. A useful extension would allow functions with non-sendable results to allow those results to be accessible to cross-isolation callers in the following cases:
 
 - For methods that are not actor methods, the result of isolation-crossing calls to those methods are always available to the caller. 
-  - By default, results are provided in the same region as `self` and any other arguments (except `transferring` arguments (see above)[#transferringargs])
+  - By default, results are provided in the same region as `self` and any other arguments (except `transferring` arguments, [see above](#transferringargs))
   - If the `fresh` keyword is placed on the result type in the function signature (e.g. `func generateFreshPerson(...) -> fresh Person`), then the result is provided in a fresh region
 - For actor methods:
   -  If the result is not annotated with the `fresh` keyword, then it is never accessible to cross-isolation callers, as the result is in the same region as actor-isolated storage, which is not accessible to the caller.'
