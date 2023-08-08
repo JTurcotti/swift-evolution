@@ -450,15 +450,18 @@ In the system outlined up to this point, a notable weak point lies in that regio
 
 ```swift
 actor IndecisiveBox {
-  var contents : NonSendable
-  
-  func setContents(_ val : NonSendable) {
+  var contents : NonSendable?
+
+  // set `contents` to the passed `val`, and return the old value
+  // of `contents`
+  func replaceContents(_ val : NonSendable?) -> NonSendable? {
+    let oldContents = contents
     contents = val
+    return oldContents
   }
   
   func swapWithOtherBox(_ otherBox : IndecisiveBox) async {
-    let otherContents = await otherBox.contents
-    await otherBox.setContents(contents) // warning: call site passes `self` or a non-sendable argument of this function to another thread, potentially yielding a race with the caller
+    let otherContents = await otherBox.replaceContents(contents) // warning: call site passes `self` or a non-sendable argument of this function to another thread, potentially yielding a race with the caller
     contents = otherContents
   }
 }
